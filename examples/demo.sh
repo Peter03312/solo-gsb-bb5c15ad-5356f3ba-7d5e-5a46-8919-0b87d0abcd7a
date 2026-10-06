@@ -288,3 +288,46 @@ curl -s -X POST "$BASE/devices/D1/cycles/boot-x/drift-audit" \
 curl -s -X POST "$BASE/devices/D1/cycles/default/drift-audit" \
   -H 'Content-Type: application/json' \
   -d '{"max_drift_ppm":100,"version_no":999}' | pp
+
+# ----------------------------------------------------------------------
+# 锚点更正覆盖预演（coverage rehearsal）：更正前预演覆盖会否恶化（只读）
+# ----------------------------------------------------------------------
+
+echo; echo "== 覆盖预演：取 D2/default 周期详情中的内容指纹 =="
+FP2=$(curl -s "$BASE/devices/D2/cycles/default" | python3 -c "import sys,json;print(json.load(sys.stdin)['cycle']['fingerprint'])")
+echo "D2/default fingerprint: $FP2"
+
+echo; echo "== 预演：D2/default 锚点拟整体平移到 1.8e12（输出 before/after 与恶化区间）=="
+echo "-- 同一当前快照内分别计算更正前/假设更正后的覆盖（其他周期与设备保持当前值）；"
+echo "-- regressions 列出原先达标而预演后不达标的各个连续区间 --"
+curl -s -X POST "$BASE/devices/D2/cycles/default/coverage-rehearsal" \
+  -H 'Content-Type: application/json' \
+  -d "{\"fingerprint\":\"$FP2\",\"anchors\":[{\"local_ms\":0,\"utc_ms\":1800000000000},{\"local_ms\":60000,\"utc_ms\":1800000060000}],\"start_ms\":1699999997000,\"end_ms\":1700000062000,\"min_devices\":2}" | pp
+
+echo; echo "== 预演只读：当前时间轴不受影响（CAP-0002 投影不变）=="
+curl -s "$BASE/segments/CAP-0002" | pp
+
+echo; echo "== 非法预演请求（只读，均不改数据）=="
+echo "-- 指纹与当前内容不一致（指纹过期）-> 409 fingerprint_stale --"
+curl -s -X POST "$BASE/devices/D2/cycles/default/coverage-rehearsal" \
+  -H 'Content-Type: application/json' \
+  -d '{"fingerprint":"0000000000000000000000000000000000000000000000000000000000000000","anchors":[{"local_ms":0,"utc_ms":1699999997000},{"local_ms":60000,"utc_ms":1700000057000}],"start_ms":1699999997000,"end_ms":1700000062000,"min_devices":2}' | pp
+echo "-- 锚点 UTC 不严格递增 -> 400 anchors_not_increasing --"
+curl -s -X POST "$BASE/devices/D2/cycles/default/coverage-rehearsal" \
+  -H 'Content-Type: application/json' \
+  -d "{\"fingerprint\":\"$FP2\",\"anchors\":[{\"local_ms\":0,\"utc_ms\":1700000000000},{\"local_ms\":60000,\"utc_ms\":1700000000000}],\"start_ms\":1699999997000,\"end_ms\":1700000062000,\"min_devices\":2}" | pp
+echo "-- 空锚点列表 -> 400 validation_error --"
+curl -s -X POST "$BASE/devices/D2/cycles/default/coverage-rehearsal" \
+  -H 'Content-Type: application/json' \
+  -d "{\"fingerprint\":\"$FP2\",\"anchors\":[],\"start_ms\":1699999997000,\"end_ms\":1700000062000,\"min_devices\":2}" | pp
+echo "-- 已封存周期（D1/default）-> 409 cycle_sealed --"
+curl -s -X POST "$BASE/devices/D1/cycles/default/coverage-rehearsal" \
+  -H 'Content-Type: application/json' \
+  -d "{\"fingerprint\":\"$FP\",\"anchors\":[{\"local_ms\":1000,\"utc_ms\":1700000000250},{\"local_ms\":61000,\"utc_ms\":1700000060750}],\"start_ms\":1699999997000,\"end_ms\":1700000062000,\"min_devices\":2}" | pp
+echo "-- 设备/周期不存在 -> 404 --"
+curl -s -X POST "$BASE/devices/NOPE/cycles/default/coverage-rehearsal" \
+  -H 'Content-Type: application/json' \
+  -d "{\"fingerprint\":\"$FP2\",\"anchors\":[{\"local_ms\":0,\"utc_ms\":0}],\"start_ms\":0,\"end_ms\":1000,\"min_devices\":1}" | pp
+curl -s -X POST "$BASE/devices/D2/cycles/boot-x/coverage-rehearsal" \
+  -H 'Content-Type: application/json' \
+  -d "{\"fingerprint\":\"$FP2\",\"anchors\":[{\"local_ms\":0,\"utc_ms\":0}],\"start_ms\":0,\"end_ms\":1000,\"min_devices\":1}" | pp

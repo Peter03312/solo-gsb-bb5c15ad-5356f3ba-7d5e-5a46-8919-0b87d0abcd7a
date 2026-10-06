@@ -61,6 +61,8 @@ def h_root(ctx, body, query):
             "POST   /segments/clip                     # 回放裁剪：按 UTC 半开窗口裁出可回放片段",
             "POST   /devices/{device_id}/cycles/{cycle_id}/drift-audit "
             "# 现场时钟漂移审计：相邻锚点配对算速率/漂移 ppm，标出超阈值区间",
+            "POST   /devices/{device_id}/cycles/{cycle_id}/coverage-rehearsal "
+            "# 锚点更正覆盖预演：更正前后覆盖对比与恶化区间（只读）",
             "GET    /segments                                      # 可加 ?device_id=&cycle_id=",
             "GET    /segments/{capture_id}",
             "DELETE /segments/{capture_id}",
@@ -166,6 +168,11 @@ def h_drift_audit(ctx, body, query, device_id, cycle_id):
                                validate_id(cycle_id, "cycle_id"), body)
 
 
+def h_coverage_rehearsal(ctx, body, query, device_id, cycle_id):
+    return service.rehearse_coverage(ctx.db_path, device_id,
+                                     validate_id(cycle_id, "cycle_id"), body)
+
+
 def h_publish(ctx, body, query):
     return service.publish_version(ctx.db_path, body)
 
@@ -193,6 +200,8 @@ ROUTES = [
     ("POST", r"^/devices/(?P<device_id>[^/]+)/cycles/(?P<cycle_id>[^/]+)/seal$", h_seal_cycle),
     ("POST", r"^/devices/(?P<device_id>[^/]+)/cycles/(?P<cycle_id>[^/]+)/drift-audit$",
      h_drift_audit),
+    ("POST", r"^/devices/(?P<device_id>[^/]+)/cycles/(?P<cycle_id>[^/]+)/coverage-rehearsal$",
+     h_coverage_rehearsal),
     ("POST", r"^/devices/(?P<device_id>[^/]+)/anchors$", h_add_anchor),
     ("GET", r"^/devices/(?P<device_id>[^/]+)/anchors$", h_list_anchors),
     ("PUT", r"^/devices/(?P<device_id>[^/]+)/anchors$", h_replace_anchors),

@@ -143,6 +143,24 @@ class TimelineClient:
             "POST", f"/devices/{device_id}/cycles/{cycle_id}/drift-audit",
             payload)
 
+    # 锚点更正覆盖预演
+    def coverage_rehearsal(self, device_id: str, cycle_id: str,
+                           fingerprint: str, anchors: list[dict],
+                           start_ms: int, end_ms: int, min_devices: int):
+        """锚点更正覆盖预演（只读）：实际更正前，预演指定 UTC 半开时段
+        [start_ms, end_ms) 的录音覆盖会否恶化。携带周期详情中的内容指纹
+        与拟整体替换该周期的非空锚点列表；服务在同一当前快照内分别计算
+        更正前（before）与假设更正后（after）的覆盖（其他周期和设备保持
+        当前值），返回两侧覆盖结论、连续缺口，以及原先达标而预演后不达标
+        的各个连续区间（regressions）。指纹过期 -> 409 fingerprint_stale；
+        周期已封存 -> 409 cycle_sealed。"""
+        return self._call(
+            "POST",
+            f"/devices/{device_id}/cycles/{cycle_id}/coverage-rehearsal",
+            {"fingerprint": fingerprint, "anchors": anchors,
+             "start_ms": start_ms, "end_ms": end_ms,
+             "min_devices": min_devices})
+
 
 def show(title: str, status: int, body: dict) -> None:
     print(f"\n=== {title} (HTTP {status}) ===")
@@ -316,6 +334,34 @@ def main() -> None:
          *cli.drift_audit("D1", 100, version_no=999))
     show("周期不存在（404 cycle_not_found）",
          *cli.drift_audit("D1", 100, cycle_id="boot-x"))
+
+    # 15. 锚点更正覆盖预演：实际更正前，预演指定 UTC 半开时段的覆盖会否恶化
+    #     携带周期详情中的内容指纹 + 拟整体替换的非空锚点列表；同一当前
+    #     快照内分别计算更正前（before）与假设更正后（after）的覆盖
+    #     （其他周期与设备保持当前值），输出两侧结论、连续缺口与
+    #     "原先达标而预演后不达标"的连续区间（regressions）；纯只读
+    _, d2_detail = cli.cycle_detail("D2", "default")
+    d2_fp = d2_detail["cycle"]["fingerprint"]
+    show("覆盖预演：D2/default 锚点拟整体平移（regressions 给出恶化区间）",
+         *cli.coverage_rehearsal(
+             "D2", "default", d2_fp,
+             [{"local_ms": 0, "utc_ms": 1800000000000},
+              {"local_ms": 60000, "utc_ms": 1800000060000}],
+             1699999997000, 1700000062000, 2))
+    #     指纹与当前内容不一致（指纹过期）-> 409 fingerprint_stale
+    show("覆盖预演：指纹过期（409 fingerprint_stale）",
+         *cli.coverage_rehearsal(
+             "D2", "default", "0" * 64,
+             [{"local_ms": 0, "utc_ms": 1699999997000},
+              {"local_ms": 60000, "utc_ms": 1700000057000}],
+             1699999997000, 1700000062000, 2))
+    #     已封存周期的锚点已冻结，预演 -> 409 cycle_sealed
+    show("覆盖预演：已封存周期（409 cycle_sealed）",
+         *cli.coverage_rehearsal(
+             "D1", "default", fp,
+             [{"local_ms": 1000, "utc_ms": 1700000000250},
+              {"local_ms": 61000, "utc_ms": 1700000060750}],
+             1699999997000, 1700000062000, 2))
 
 
 if __name__ == "__main__":

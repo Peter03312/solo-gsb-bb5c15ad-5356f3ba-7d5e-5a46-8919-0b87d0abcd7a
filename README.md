@@ -10,6 +10,7 @@
 - **覆盖审计（coverage audit，v1.4 新增）**：现场复核时判断指定 UTC 毫秒半开区间内是否**始终有足够不同设备录到声音**——只计可定位声段并与查询区间相交，同设备重叠声段只算一台，按设备集合变化切成最大半开片段（每段给出排序后的设备编号、数量与是否达标），不足门槛的相邻片段合并为连续缺口；可审计**当前时间轴**（一致快照）或**指定已发布版本**（历史审计只依据已冻结声段，后续锚点/周期变更不改动历史结果）；纯只读接口，无效输入或版本不存在明确拒绝且不改动数据。
 - **回放裁剪（playback clip，v1.5 新增）**：现场复核人员按 UTC 毫秒半开窗口裁出**可交给录音设备回放的片段**——每条与窗口相交且可定位的声段返回本地裁剪起止与映射后的 UTC 起止，本地边界取该声段本地范围内"映射 UTC 首次不小于窗口对应边界"的整数毫秒（不存在则截在声段末端），裁后起止相同的声段不返回；可查询**当前时间轴**或**指定已发布版本**（只用发布时冻结的锚点与声段，旧版快照缺失的周期归属按 default 处理）；同设备重叠声段分别返回，按 UTC 起点、设备编号、采集编号排序；纯只读接口，无效输入或版本不存在明确拒绝且不改动数据。
 - **现场时钟漂移审计（drift audit，v1.6 新增）**：现场校准后，运维人员提交**设备编号、周期编号、非负最大时钟漂移 ppm**（可选已发布版本号）；服务读取该周期**当前锚点**或**指定版本冻结锚点**（旧版快照缺失周期归属按 default 处理），按本地时间**相邻配对**，逐段计算 UTC/本地速率与（有符号）漂移 ppm，标出 `|漂移|` 超过阈值的区间，并给出**首尾锚点、本地/UTC 区间跨度、异常原因与偏快/偏慢方向**；锚点少于两个（`400 insufficient_anchors`）、阈值非法（`400 invalid_threshold`）、设备/周期/版本不存在（`404`）均明确拒绝、**不改动任何数据**；纯只读接口，封存周期同样可审计。
+- **锚点更正覆盖预演（coverage rehearsal，v1.7 新增）**：现场人员在实际更正某设备周期锚点前，提交**设备与周期编号、周期详情中的内容指纹、拟整体替换的非空锚点列表、UTC 半开时段与最少设备数**；服务在**同一当前快照**内按现有周期映射与毫秒取整规则分别计算**更正前**与**假设更正后**的覆盖（其他周期和设备保持当前值），输出两侧覆盖结论、连续缺口，以及**原先达标而预演后不达标的各个连续区间**；指纹过期（`409 fingerprint_stale`）、周期已封存（`409 cycle_sealed`）、锚点不严格递增（`400 anchors_not_increasing`）、时间或门槛非法（`400`）、设备或周期不存在（`404`）均明确拒绝；纯只读接口，不影响当前时间轴或已发布版本。
 
 ## 快速开始
 
@@ -201,6 +202,43 @@ python3 -m app          # 自动建库建表（默认 ./data/timeline.db），�
 }
 ```
 
+### 锚点更正覆盖预演（coverage rehearsal）
+
+现场人员在实际更正某设备周期的锚点前，需要预演"指定 UTC 时段的录音覆盖会否恶化"。`POST /devices/{id}/cycles/{cycle_id}/coverage-rehearsal` 在不改动任何数据的前提下对比更正前后的覆盖：
+
+- **请求体**：`{"fingerprint", "anchors", "start_ms", "end_ms", "min_devices"}`——`fingerprint` 为**周期详情**（`GET /devices/{id}/cycles/{cycle_id}`）中的内容指纹，确认预演基于的当前内容；`anchors` 为**拟整体替换该周期的非空锚点列表**（`{local_ms, utc_ms}`，项内 `cycle_id` 可省略，若携带须与路径周期一致）；`[start_ms, end_ms)` 为预演时段（UTC 毫秒半开区间）；`min_devices` 为最少设备数（正整数）。
+- **双侧计算**：在**同一读事务的当前快照**上，按现有周期映射与毫秒取整规则分别计算——`before` 为当前锚点下的覆盖；`after` 仅把该 (设备, 周期) 的锚点**整体替换**为拟用列表后重算，**其他周期和设备保持当前值**。两侧均与覆盖审计同口径：只计可定位声段、同设备重叠（含相接）声段只算一台、边界相接不重叠、不足门槛的相邻片段合并为连续缺口。
+- **恶化区间 `regressions`**：原先达标（`before` 达标）而预演后不达标（`after` 不达标）的**各个连续半开区间**，相邻者合并，每段给出 `start_ms` / `end_ms`、预演后段内出现过的设备并集 `after_device_ids` 与峰值设备数 `after_max_device_count`；`worsened` / `regression_count` 给出整体结论。只报告恶化，不报告改善。
+- **响应**：`before` / `after` 各为一套完整覆盖结论（`ok`、`covered_ms` / `gap_ms`、`located_segment_count`、最大半开片段 `fragments` 与连续缺口 `gaps`），另附核对通过的 `fingerprint` 与拟用锚点数 `anchor_count`。
+- **拒绝场景（均不改动数据）**：指纹与当前内容不一致（内容已被晚到记录改动、指纹过期）→ `409 fingerprint_stale`（`details.current_fingerprint` 给出当前指纹）；周期已封存（锚点已冻结，预演无意义）→ `409 cycle_sealed`；锚点列表为空/项非法/项内周期与路径不一致 → `400 validation_error`；锚点本地时间重复或 UTC 不严格递增 → `400 anchors_not_increasing`；时间非法/起点不小于终点/门槛非正整数 → `400 invalid_time` / `400 invalid_range` / `400 invalid_threshold`；设备或周期不存在 → `404 device_not_found` / `404 cycle_not_found`。
+- **纯只读**：预演在单个读事务的一致快照上计算，不写入任何数据——当前时间轴、周期内容指纹与已发布版本均不受影响；与更正/发布并发时每次响应都是一致快照。
+
+响应示例（D1/default 锚点拟整体平移 +20000ms，其声段移出预演时段；节选）：
+
+```json
+{
+  "device_id": "D1", "cycle_id": "default",
+  "fingerprint": "3ce3...(64位hex)", "anchor_count": 2,
+  "start_ms": 0, "end_ms": 15000, "min_devices": 2,
+  "before": {"ok": true, "covered_ms": 15000, "gap_ms": 0,
+             "located_segment_count": 2,
+             "fragments": [{"start_ms": 0, "end_ms": 15000,
+                            "device_ids": ["D1", "D2"],
+                            "device_count": 2, "meets_threshold": true}],
+             "gaps": []},
+  "after":  {"ok": false, "covered_ms": 0, "gap_ms": 15000,
+             "located_segment_count": 1,
+             "fragments": [{"start_ms": 0, "end_ms": 15000,
+                            "device_ids": ["D2"],
+                            "device_count": 1, "meets_threshold": false}],
+             "gaps": [{"start_ms": 0, "end_ms": 15000,
+                       "device_ids": ["D2"], "max_device_count": 1}]},
+  "worsened": true, "regression_count": 1,
+  "regressions": [{"start_ms": 0, "end_ms": 15000,
+                   "after_device_ids": ["D2"], "after_max_device_count": 1}]
+}
+```
+
 ### 线性漂移映射
 
 每台设备、**每个时钟周期**的锚点按本地时间排序后，在相邻锚点 `(l0,u0)`、`(l1,u1)` 间线性映射：
@@ -244,6 +282,12 @@ utc(t) = u0 + (t - l0) * (u1 - u0) / (l1 - l0)     # 结果四舍五入到毫秒
 | 漂移审计：锚点少于两个 | `400 insufficient_anchors` |
 | 漂移审计：阈值为负/非数字/NaN/Infinity | `400 invalid_threshold` |
 | 漂移审计：设备/周期/版本不存在 | `404 device_not_found` / `404 cycle_not_found` / `404 version_not_found` |
+| 覆盖预演：指纹与当前内容不一致（指纹过期） | `409 fingerprint_stale` |
+| 覆盖预演：周期已封存 | `409 cycle_sealed` |
+| 覆盖预演：锚点列表为空/项非法/项内周期与路径不一致 | `400 validation_error` |
+| 覆盖预演：锚点不严格递增 | `400 anchors_not_increasing` |
+| 覆盖预演：时间/区间/门槛非法 | `400 invalid_time` / `400 invalid_range` / `400 invalid_threshold` |
+| 覆盖预演：设备/周期不存在 | `404 device_not_found` / `404 cycle_not_found` |
 
 ### 幂等与冲突
 
@@ -290,6 +334,7 @@ utc(t) = u0 + (t - l0) * (u1 - u0) / (l1 - l0)     # 结果四舍五入到毫秒
 | POST | `/coverage/audit` | **覆盖审计** `{start_ms, end_ms, min_devices, version_no?}`（只读，省略版本号=当前时间轴） |
 | POST | `/segments/clip` | **回放裁剪** `{start_ms, end_ms, version_no?}`（只读，省略版本号=当前时间轴） |
 | POST | `/devices/{id}/cycles/{cycle_id}/drift-audit` | **现场时钟漂移审计** `{max_drift_ppm, version_no?}`（只读，相邻锚点配对算速率/漂移，标出超阈值区间） |
+| POST | `/devices/{id}/cycles/{cycle_id}/coverage-rehearsal` | **锚点更正覆盖预演** `{fingerprint, anchors, start_ms, end_ms, min_devices}`（只读，输出更正前后覆盖与恶化区间） |
 | POST | `/versions` | 发布新版本（可选 `{"note": "..."}`），冻结各周期锚点与投影 |
 | GET | `/versions` / `/versions/{n}` | 版本列表 / 版本完整快照与差异（旧版本无周期字段） |
 
@@ -577,6 +622,54 @@ curl -s -X POST $BASE/devices/D1/cycles/default/drift-audit \
 #    版本不存在 -> 404 version_not_found
 ```
 
+### 锚点更正覆盖预演（更正前预演覆盖会否恶化）
+
+```bash
+BASE=http://localhost:8000
+
+# 前置：D1、D2 恒等映射设备，声段全程 [0,15000) 共同覆盖（min_devices=2 达标）
+
+# 1. 取周期详情中的内容指纹（预演请求必须携带，确认预演基于的当前内容）
+FP=$(curl -s $BASE/devices/D1/cycles/default | python3 -c "import sys,json;print(json.load(sys.stdin)['cycle']['fingerprint'])")
+
+# 2. 预演：拟把 D1/default 锚点整体平移 +20000ms
+#    同一当前快照内分别计算更正前（before）与假设更正后（after）的覆盖，
+#    其他周期和设备保持当前值；regressions 列出原先达标而预演后不达标的连续区间
+curl -s -X POST $BASE/devices/D1/cycles/default/coverage-rehearsal \
+  -H 'Content-Type: application/json' \
+  -d "{\"fingerprint\":\"$FP\",\"anchors\":[{\"local_ms\":0,\"utc_ms\":20000},
+      {\"local_ms\":100000,\"utc_ms\":120000}],
+      \"start_ms\":0,\"end_ms\":15000,\"min_devices\":2}"
+# => {"before":{"ok":true,...},"after":{"ok":false,...},
+#     "worsened":true,"regression_count":1,
+#     "regressions":[{"start_ms":0,"end_ms":15000,
+#                     "after_device_ids":["D2"],"after_max_device_count":1}]}
+
+# 3. 预演只读：当前时间轴与已发布版本均不受影响
+curl -s $BASE/segments/CAP-0001        # 投影仍按当前锚点计算，未变
+
+# 4. 明确拒绝（均不改动数据）：
+#    期间有晚到记录改动周期内容 -> 指纹过期 409 fingerprint_stale；
+#    周期已封存 -> 409 cycle_sealed；锚点不严格递增 -> 400 anchors_not_increasing；
+#    空锚点列表 -> 400 validation_error；设备/周期不存在 -> 404
+curl -s -X POST $BASE/devices/D1/anchors -H 'Content-Type: application/json' \
+  -d '{"local_ms":50000,"utc_ms":50000}'     # 晚到记录改动内容，旧指纹即过期
+curl -s -X POST $BASE/devices/D1/cycles/default/coverage-rehearsal \
+  -H 'Content-Type: application/json' \
+  -d "{\"fingerprint\":\"$FP\",\"anchors\":[{\"local_ms\":0,\"utc_ms\":0},
+      {\"local_ms\":100000,\"utc_ms\":100000}],
+      \"start_ms\":0,\"end_ms\":15000,\"min_devices\":2}"
+# => 409 fingerprint_stale（details.current_fingerprint 给出当前指纹，
+#    重新获取周期详情后可再预演）
+```
+
+预演场景的最小可运行复现（自动建设备/锚点/声段并验证恶化区间、原样替换无恶化、
+只读性与各类明确错误）：
+
+```bash
+python3 examples/rehearsal_example.py http://localhost:8000
+```
+
 最小可运行复现（自动建设备/锚点并验证逐段速率/漂移、超阈值标记、历史版本冻结
 与各类明确错误）：
 
@@ -656,8 +749,9 @@ python3 -m unittest discover -s tests -v
 - `tests/test_coverage.py`（15 个）：覆盖审计的片段切分与达标判定、同设备重叠只算一台、边界相接不重叠、零长度声段不贡献、不可定位声段不计、无数据整段为缺口、相邻缺口合并、查询区间裁剪、int64 边界、**历史版本审计冻结**（后续锚点更正/声段增删/周期纠正/新发布均不改历史结果）、非法输入与版本不存在拒绝且数据不变、审计只读、以及**审计与更正/发布并发**下每次响应都是一致快照；
 - `tests/test_clip.py`（18 个）：回放裁剪的窗口相交判定与本地边界"首次不小于"规则（含线性漂移取整与取整平台）、截在声段末端、裁后退化不返回（零长度/边界相接/陡峭漂移）、不可定位声段不返回、同设备重叠分别返回、排序规则、周期感知（只用所属周期锚点）、**历史版本裁剪冻结**（冻结锚点+声段，后续变更不改历史结果）、**旧版（format_rev=1）快照周期归属按 default**、int64 边界、非法输入与版本不存在拒绝且数据不变、裁剪只读、以及**裁剪与更正/发布并发**下每次响应都是一致快照。
 - `tests/test_drift.py`（24 个）：漂移审计的相邻配对速率/漂移（有符号，含偏快/偏慢方向）计算、首尾锚点与本地/UTC 跨度、恰好等于阈值不算超差（精确分数比较，含浮点阈值边界）、低于阈值不标异常、混合段只标超差段与全段最大绝对漂移、周期独立（只用指定周期锚点）、封存周期可审计、**历史版本审计冻结**（后续锚点更正/新发布不改历史结果）、**旧版（format_rev=1）冻结锚点周期归属按 default**（新周期旧版本无冻结锚点仍报锚点不足）、锚点不足/阈值非法（含 NaN/Infinity）/设备/周期/版本不存在明确拒绝且数据不变、审计只读、int64 锚点、纯逻辑（乱序排序/精确边界/锚点不足）以及**审计与更正/发布并发**下每次响应都是一致快照。
+- `tests/test_rehearsal.py`（18 个）：覆盖预演的更正前/后双侧计算（仅替换目标周期锚点，其他周期与设备保持当前值）、恶化区间的单段/多段/相邻合并（含预演后设备并集与峰值）、同设备重叠只算一台、更正后不可定位声段不计、线性漂移与取整规则沿用、int64 边界、指纹过期/周期封存/锚点不严格递增/空锚点列表/项内周期不一致/时间区间门槛非法/设备周期不存在的明确拒绝且数据不变、预演只读（时间轴、周期指纹与已发布版本不变）、纯逻辑（原子区间对齐与合并）以及**预演与其他设备写入/发布并发**下每次响应都是一致快照。
 
-## 升级与数据迁移（v1.0 → v1.1 → v1.2 → v1.3 → v1.4 → v1.5 → v1.6）
+## 升级与数据迁移（v1.0 → v1.1 → v1.2 → v1.3 → v1.4 → v1.5 → v1.6 → v1.7）
 
 - 沿用原启动方式（`python3 -m app` / Docker / Compose），服务启动时自动识别并在线迁移旧库，无需手工操作；
 - 旧设备自动补登 `default` 周期；旧锚点与声段一律归入 `default`；旧声段内容指纹按含周期的新口径重算（默认周期同内容重传仍为幂等）；
@@ -668,6 +762,7 @@ python3 -m unittest discover -s tests -v
 - v1.4 新增 `POST /coverage/audit` 覆盖审计端点（只读），**无表结构变更**，旧库直接可用；历史版本审计基于既有 `version_segments` 冻结投影，旧版本（含 `format_rev=1`）同样可审计。
 - v1.5 新增 `POST /segments/clip` 回放裁剪端点（只读），**无表结构变更**，旧库直接可用；历史版本裁剪基于既有 `version_anchors` / `version_segments` 冻结快照，旧版本（含 `format_rev=1`，周期归属按 default 处理）同样可裁剪。
 - v1.6 新增 `POST /devices/{id}/cycles/{cycle_id}/drift-audit` 现场时钟漂移审计端点（只读），**无表结构变更**，旧库直接可用；历史版本审计基于既有 `version_anchors` 冻结锚点，旧版本（含 `format_rev=1`，周期归属按 default 处理）同样可审计。
+- v1.7 新增 `POST /devices/{id}/cycles/{cycle_id}/coverage-rehearsal` 锚点更正覆盖预演端点（只读），**无表结构变更**，旧库直接可用；预演只读取当前锚点/声段/周期封存状态与周期内容指纹，已发布版本不受影响。
 
 ## 项目结构
 
@@ -676,7 +771,7 @@ app/
   __main__.py   # 入口：初始化数据库 + 启动 HTTP 服务
   server.py     # HTTP 路由、JSON 编解码、错误响应（http.server）
   service.py    # 服务层：各 API 操作（单事务校验+写入）
-  logic.py      # 纯逻辑：校验、线性漂移映射、漂移审计、排序、版本差异、周期内容指纹
+  logic.py      # 纯逻辑：校验、线性漂移映射、覆盖审计与预演恶化区间、回放裁剪、漂移审计、排序、版本差异、周期内容指纹
   db.py         # SQLite 连接、建表、旧库迁移（v1 整表迁移 + 封存列补齐）、事务助手（WAL）
 tests/test_api.py      # 端到端测试（原有能力，保持兼容）
 tests/test_cycles.py   # 端到端测试（时钟周期 + 旧库迁移/旧版本不变）
@@ -686,9 +781,11 @@ tests/test_coverage.py # 端到端测试（覆盖审计 + 历史冻结 + 并发�
 tests/test_clip.py     # 端到端测试（回放裁剪 + 历史冻结 + 旧版快照 + 并发一致性）
 tests/test_clip_regression.py # 回归测试（报告窗口当前时间轴裁剪 + 排除/拒绝规则）
 tests/test_drift.py    # 端到端测试（现场时钟漂移审计 + 历史冻结 + 旧版快照 + 并发一致性）
-examples/demo.sh       # curl 调用示例（含周期、封存、批量纠正、覆盖审计、回放裁剪与漂移审计）
-examples/client.py     # Python 客户端示例（含漂移审计等全部 v1.6 能力）
+tests/test_rehearsal.py # 端到端测试（锚点更正覆盖预演 + 恶化区间 + 拒绝场景 + 并发一致性）
+examples/demo.sh       # curl 调用示例（含周期、封存、批量纠正、覆盖审计、回放裁剪、漂移审计与覆盖预演）
+examples/client.py     # Python 客户端示例（含漂移审计、覆盖预演等全部 v1.7 能力）
 examples/clip_example.py # 回放裁剪报告窗口最小复现示例
 examples/drift_example.py # 现场时钟漂移审计最小复现示例
+examples/rehearsal_example.py # 锚点更正覆盖预演最小复现示例
 Dockerfile / docker-compose.yml
 ```

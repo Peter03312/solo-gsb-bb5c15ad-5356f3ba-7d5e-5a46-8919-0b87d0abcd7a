@@ -18,6 +18,12 @@
 声明预期原周期与目标周期，任一项无效即整批拒绝（不改动任何数据）；
 成功后声段起止/备注/创建时间/采集编号不变，内容指纹按新周期重算，
 各声段按目标周期锚点重算定位，相关周期内容指纹随之更新。
+
+锚点更正覆盖预演（coverage rehearsal，v1.7）：现场人员在实际更正某
+设备周期锚点前，携带周期详情中的内容指纹与拟整体替换的锚点列表，
+在同一当前快照内分别计算更正前与假设更正后的覆盖（其他周期和设备
+保持当前值），输出两侧覆盖结论、连续缺口，以及原先达标而预演后
+不达标的各个连续区间；预演只读，不影响当前时间轴或已发布版本。
 """
 from __future__ import annotations
 
@@ -26,7 +32,8 @@ from datetime import datetime, timezone
 from . import db
 from .logic import (ApiError, DEFAULT_CYCLE_ID, STATUS_LOCATED,
                     STATUS_UNLOCATABLE, compute_changes, compute_clips,
-                    compute_coverage, compute_drift_report, cycle_fingerprint,
+                    compute_coverage, compute_coverage_regressions,
+                    compute_drift_report, cycle_fingerprint,
                     project_segment, require_fields, require_payload,
                     segment_content_hash, sort_projections, validate_cycle_id,
                     validate_fingerprint, validate_id, validate_max_drift_ppm,
@@ -208,6 +215,32 @@ def _check_insert_increasing(existing: list[dict], local_ms: int, utc_ms: int) -
                        f"锚点 UTC 时间必须严格递增：新锚点 utc_ms={utc_ms} "
                        f"未小于后一锚点 (local_ms={nxt['local_ms']}, utc_ms={nxt['utc_ms']})",
                        {"next": nxt, "utc_ms": utc_ms})
+
+
+def _sorted_strictly_increasing_pairs(cycle_id: str,
+                                      pairs: list[tuple[int, int]]) -> list:
+    """锚点 (local_ms, utc_ms) 列表按本地毫秒排序并校验严格递增。
+
+    锚点更正（PUT）与覆盖预演共用的校验：同一周期内本地时间必须唯一、
+    UTC 必须严格递增，任一违反即 400 anchors_not_increasing（不写库）。
+    返回排序后的列表。
+    """
+    pairs = sorted(pairs, key=lambda x: x[0])
+    for i in range(1, len(pairs)):
+        (pl, pu), (cl, cu) = pairs[i - 1], pairs[i]
+        if cl == pl:
+            raise ApiError(400, "anchors_not_increasing",
+                           f"周期 {cycle_id} 内锚点本地时间重复：local_ms={cl}，"
+                           f"锚点本地时间必须严格递增",
+                           {"cycle_id": cycle_id, "local_ms": cl})
+        if cu <= pu:
+            raise ApiError(400, "anchors_not_increasing",
+                           f"周期 {cycle_id} 内锚点 UTC 时间必须严格递增："
+                           f"local_ms={pl} 的 utc_ms={pu}，local_ms={cl} 的 utc_ms={cu}",
+                           {"cycle_id": cycle_id,
+                            "prev": {"local_ms": pl, "utc_ms": pu},
+                            "current": {"local_ms": cl, "utc_ms": cu}})
+    return pairs
 
 
 # ---------------------------------------------------------------- 设备
@@ -459,22 +492,7 @@ def replace_anchors(db_path: str, device_id: str, body):
     # 逐周期校验（不写库，失败即整体拒绝）
     validated: dict[str, list[tuple[int, int]]] = {}
     for cyc, pairs in by_cycle.items():
-        pairs.sort(key=lambda x: x[0])
-        for i in range(1, len(pairs)):
-            (pl, pu), (cl, cu) = pairs[i - 1], pairs[i]
-            if cl == pl:
-                raise ApiError(400, "anchors_not_increasing",
-                               f"周期 {cyc} 内锚点本地时间重复：local_ms={cl}，"
-                               f"锚点本地时间必须严格递增",
-                               {"cycle_id": cyc, "local_ms": cl})
-            if cu <= pu:
-                raise ApiError(400, "anchors_not_increasing",
-                               f"周期 {cyc} 内锚点 UTC 时间必须严格递增："
-                               f"local_ms={pl} 的 utc_ms={pu}，local_ms={cl} 的 utc_ms={cu}",
-                               {"cycle_id": cyc,
-                                "prev": {"local_ms": pl, "utc_ms": pu},
-                                "current": {"local_ms": cl, "utc_ms": cu}})
-        validated[cyc] = pairs
+        validated[cyc] = _sorted_strictly_increasing_pairs(cyc, pairs)
     with db.session(db_path) as conn:
         with db.write_txn(conn):
             _get_device(conn, device_id)
@@ -884,6 +902,110 @@ def coverage_audit(db_path: str, body):
     return 200, {"source": source, "version_no": version_no,
                  "start_ms": start_ms, "end_ms": end_ms,
                  "min_devices": min_devices, **result}
+
+
+# ---------------------------------------------------------------- 锚点更正覆盖预演
+
+def rehearse_coverage(db_path: str, device_id: str, cycle_id: str, body):
+    """锚点更正覆盖预演（只读）：在实际更正前，预演指定 UTC 半开时段的
+    录音覆盖会否恶化。
+
+    - 请求体 {fingerprint, anchors, start_ms, end_ms, min_devices}：
+      fingerprint 为周期详情中的内容指纹（确认预演基于的当前内容）；
+      anchors 为拟整体替换该周期的非空锚点列表；[start_ms, end_ms) 为
+      预演时段；min_devices 为最少设备数（正整数）；
+    - 在同一读事务的当前快照上，按现有周期映射与毫秒取整规则分别计算
+      更正前（before）与假设更正后（after）的覆盖：after 仅把该
+      (设备, 周期) 的锚点整体替换为拟用列表，其他周期与设备保持当前值；
+    - 同设备重叠声段只算一台，不可定位声段不计（与覆盖审计同口径）；
+      输出两侧覆盖结论与连续缺口，以及原先达标而预演后不达标的各个
+      连续区间（regressions）；
+    - 拒绝场景：指纹过期（409 fingerprint_stale）、周期已封存
+      （409 cycle_sealed）、锚点不严格递增（400 anchors_not_increasing）、
+      时间或门槛非法（400）、设备或周期不存在（404）；
+    - 本接口只读：不改动当前时间轴、周期内容与已发布版本。
+    """
+    payload = require_payload(body)
+    require_fields(payload, ["fingerprint", "anchors",
+                             "start_ms", "end_ms", "min_devices"])
+    fingerprint = validate_fingerprint(payload["fingerprint"])
+    items = payload["anchors"]
+    if not isinstance(items, list):
+        raise ApiError(400, "validation_error", "anchors 必须是数组",
+                       {"received_type": type(items).__name__})
+    if not items:
+        raise ApiError(400, "validation_error",
+                       "anchors 不能为空：覆盖预演需要拟整体替换该周期的"
+                       "非空锚点列表")
+    pairs = []
+    for i, item in enumerate(items):
+        if not isinstance(item, dict):
+            raise ApiError(400, "validation_error", f"anchors[{i}] 必须是对象",
+                           {"received_type": type(item).__name__})
+        require_fields(item, ["local_ms", "utc_ms"])
+        item_cycle = item.get("cycle_id")
+        if item_cycle is not None and item_cycle != cycle_id:
+            raise ApiError(400, "validation_error",
+                           f"anchors[{i}].cycle_id 与路径周期 {cycle_id} 不一致："
+                           f"覆盖预演只针对路径指定的单个周期，"
+                           f"锚点项不应携带其他周期编号",
+                           {"cycle_id": cycle_id, "item_cycle_id": item_cycle})
+        pairs.append((validate_ms(item["local_ms"], f"anchors[{i}].local_ms"),
+                      validate_ms(item["utc_ms"], f"anchors[{i}].utc_ms")))
+    pairs = _sorted_strictly_increasing_pairs(cycle_id, pairs)
+    start_ms = validate_ms(payload["start_ms"], "start_ms")
+    end_ms = validate_ms(payload["end_ms"], "end_ms")
+    if start_ms >= end_ms:
+        raise ApiError(400, "invalid_range",
+                       f"预演时段起点 start_ms={start_ms} 必须小于终点 "
+                       f"end_ms={end_ms}（半开区间 [start_ms, end_ms)）",
+                       {"start_ms": start_ms, "end_ms": end_ms})
+    min_devices = validate_min_devices(payload["min_devices"])
+    with db.session(db_path) as conn, db.read_txn(conn):
+        _get_device(conn, device_id)
+        cycle = _get_cycle(conn, device_id, cycle_id)
+        # 已封存周期的锚点已冻结、不存在"更正"，预演无意义 -> 拒绝
+        _raise_if_sealed(cycle)
+        # 同一事务内核对当前内容：指纹过期（内容已被晚到记录改动）即拒绝
+        cur_anchors, cur_segs = _cycle_contents(conn, device_id, cycle_id)
+        current_fp = cycle_fingerprint(device_id, cycle_id, cur_anchors, cur_segs)
+        if fingerprint != current_fp:
+            raise ApiError(
+                409, "fingerprint_stale",
+                f"请求指纹与设备 {device_id} 周期 {cycle_id} 的当前内容不一致"
+                f"（内容已变化，指纹过期），请重新获取周期详情后再预演",
+                {"device_id": device_id, "cycle_id": cycle_id,
+                 "current_fingerprint": current_fp})
+        # 同一当前快照：全部声段 + 当前锚点表
+        rows = conn.execute("SELECT * FROM segments ORDER BY capture_id").fetchall()
+        anchors_now = _anchors_map(conn)
+        # 假设更正后：仅整体替换该 (设备, 周期) 的锚点，
+        # 其他周期与设备保持当前值
+        anchors_hypo = dict(anchors_now)
+        anchors_hypo[(device_id, cycle_id)] = (
+            [l for l, _ in pairs], [u for _, u in pairs])
+        located_before, located_after = [], []
+        for r in rows:
+            seg = _row_to_segment(r)
+            key = (r["device_id"], r["cycle_id"])
+            proj = project_segment(seg, anchors_now.get(key, ([], [])))
+            if proj["status"] == STATUS_LOCATED:
+                located_before.append(proj)
+            proj = project_segment(seg, anchors_hypo.get(key, ([], [])))
+            if proj["status"] == STATUS_LOCATED:
+                located_after.append(proj)
+    before = compute_coverage(located_before, start_ms, end_ms, min_devices)
+    after = compute_coverage(located_after, start_ms, end_ms, min_devices)
+    regressions = compute_coverage_regressions(before["fragments"],
+                                               after["fragments"])
+    return 200, {"device_id": device_id, "cycle_id": cycle_id,
+                 "fingerprint": current_fp, "anchor_count": len(pairs),
+                 "start_ms": start_ms, "end_ms": end_ms,
+                 "min_devices": min_devices,
+                 "before": before, "after": after,
+                 "worsened": bool(regressions),
+                 "regression_count": len(regressions),
+                 "regressions": regressions}
 
 
 # ---------------------------------------------------------------- 回放裁剪

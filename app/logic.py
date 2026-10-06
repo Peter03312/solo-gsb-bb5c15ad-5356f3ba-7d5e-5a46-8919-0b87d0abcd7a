@@ -462,6 +462,42 @@ def compute_coverage(located: list[dict], start_ms: int, end_ms: int,
             "gaps": gaps}
 
 
+def compute_coverage_regressions(before_fragments: list[dict],
+                                 after_fragments: list[dict]) -> list[dict]:
+    """覆盖预演：原先达标而假设更正后不达标的最大连续半开区间。
+
+    before/after 的 fragments 都是同一查询区间的有序、不重不漏划分
+    （compute_coverage 的输出，已带 meets_threshold）。双指针对齐两侧边界
+    得到原子区间，挑出"更正前达标且更正后不达标"的片段，相邻者合并为一个
+    连续区间；每个区间记录预演后段内出现过的设备并集与峰值设备数，
+    便于现场评估恶化程度。
+    """
+    regressions: list[dict] = []
+    i = j = 0
+    while i < len(before_fragments) and j < len(after_fragments):
+        b, a = before_fragments[i], after_fragments[j]
+        lo = max(b["start_ms"], a["start_ms"])
+        hi = min(b["end_ms"], a["end_ms"])
+        if lo < hi and b["meets_threshold"] and not a["meets_threshold"]:
+            if regressions and regressions[-1]["end_ms"] == lo:
+                r = regressions[-1]
+                r["end_ms"] = hi
+                r["after_device_ids"] = sorted(
+                    set(r["after_device_ids"]) | set(a["device_ids"]))
+                r["after_max_device_count"] = max(r["after_max_device_count"],
+                                                  a["device_count"])
+            else:
+                regressions.append({
+                    "start_ms": lo, "end_ms": hi,
+                    "after_device_ids": list(a["device_ids"]),
+                    "after_max_device_count": a["device_count"]})
+        if b["end_ms"] <= a["end_ms"]:
+            i += 1
+        if a["end_ms"] <= b["end_ms"]:
+            j += 1
+    return regressions
+
+
 # ---------------------------------------------------------------- 回放裁剪
 
 def _first_local_ms_with_utc_geq(locals_list: list[int], utcs_list: list[int],
