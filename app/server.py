@@ -66,6 +66,8 @@ def h_root(ctx, body, query):
             "DELETE /segments/{capture_id}",
             "GET    /timeline/current",
             "POST   /coverage/audit                # 覆盖审计：区间内是否始终有足够设备在录音",
+            "POST   /devices/{device_id}/cycles/{cycle_id}/coverage/rehearse "
+            "# 锚点更正覆盖预演：同一快照对比更正前后覆盖与恶化区间（只读）",
             "POST   /versions",
             "GET    /versions",
             "GET    /versions/{version_no}",
@@ -157,6 +159,11 @@ def h_coverage_audit(ctx, body, query):
     return service.coverage_audit(ctx.db_path, body)
 
 
+def h_coverage_rehearse(ctx, body, query, device_id, cycle_id):
+    return service.coverage_rehearse(
+        ctx.db_path, device_id, validate_id(cycle_id, "cycle_id"), body)
+
+
 def h_clip_segments(ctx, body, query):
     return service.clip_segments(ctx.db_path, body)
 
@@ -193,6 +200,8 @@ ROUTES = [
     ("POST", r"^/devices/(?P<device_id>[^/]+)/cycles/(?P<cycle_id>[^/]+)/seal$", h_seal_cycle),
     ("POST", r"^/devices/(?P<device_id>[^/]+)/cycles/(?P<cycle_id>[^/]+)/drift-audit$",
      h_drift_audit),
+    ("POST", r"^/devices/(?P<device_id>[^/]+)/cycles/(?P<cycle_id>[^/]+)/coverage/rehearse$",
+     h_coverage_rehearse),
     ("POST", r"^/devices/(?P<device_id>[^/]+)/anchors$", h_add_anchor),
     ("GET", r"^/devices/(?P<device_id>[^/]+)/anchors$", h_list_anchors),
     ("PUT", r"^/devices/(?P<device_id>[^/]+)/anchors$", h_replace_anchors),

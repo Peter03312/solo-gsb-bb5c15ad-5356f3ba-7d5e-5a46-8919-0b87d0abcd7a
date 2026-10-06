@@ -16,7 +16,7 @@ import hashlib
 import json
 import math
 import re
-from bisect import bisect_left
+from bisect import bisect_left, bisect_right
 from decimal import Decimal
 
 MAX_INT64 = 2 ** 63 - 1
@@ -460,6 +460,108 @@ def compute_coverage(located: list[dict], start_ms: int, end_ms: int,
             "located_segment_count": contributing,
             "fragments": maximal,
             "gaps": gaps}
+
+
+# ---------------------------------------------------------------- 锚点更正预演
+
+def validate_anchor_chain(pairs: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    """拟整体替换的锚点必须形成严格递增链：local_ms 互不相同，utc_ms 严格递增。
+
+    pairs 为 (local_ms, utc_ms) 列表（调用方已把两侧时间校验为 int64 毫秒
+    整数）；返回按 local_ms 升序排列的新列表，不满足严格递增即抛
+    anchors_not_increasing（与录入/更正锚点同一错误契约）。
+    """
+    ordered = sorted(pairs, key=lambda x: x[0])
+    for i in range(1, len(ordered)):
+        pl, pu = ordered[i - 1]
+        cl, cu = ordered[i]
+        if cl == pl:
+            raise ApiError(
+                400, "anchors_not_increasing",
+                f"拟替换锚点本地时间重复：local_ms={cl}，"
+                f"同一周期内锚点本地时间必须严格递增",
+                {"local_ms": cl})
+        if cu <= pu:
+            raise ApiError(
+                400, "anchors_not_increasing",
+                f"拟替换锚点 UTC 时间必须严格递增：local_ms={pl} 的 utc_ms={pu}，"
+                f"local_ms={cl} 的 utc_ms={cu}",
+                {"prev": {"local_ms": pl, "utc_ms": pu},
+                 "current": {"local_ms": cl, "utc_ms": cu}})
+    return ordered
+
+
+def _fragment_at(fragments: list[dict], starts: list[int], t: int) -> dict | None:
+    """在恰好拼满查询区间的有序最大片段中定位覆盖时刻 t 的片段（半开语义）。"""
+    i = bisect_right(starts, t) - 1
+    if 0 <= i < len(fragments) and t < fragments[i]["end_ms"]:
+        return fragments[i]
+    return None
+
+
+def compute_rehearsal_regressions(before: dict, after: dict,
+                                  start_ms: int, end_ms: int) -> dict:
+    """对比同一快照内"更正前 / 假设更正后"两侧覆盖审计结果，找出恶化区间。
+
+    - before / after：compute_coverage 在同一查询区间与同一门槛下的两侧结果
+      （片段均不重不漏地恰好拼满 [start_ms, end_ms)）；
+    - 用两侧片段边界（含查询端点）把查询区间切成更细的半开分片，逐片判定
+      是否"更正前达标 且 更正后不达标"；相邻恶化分片合并为连续区间，
+      每段记录更正前/后的峰值设备数与各自段内出现过的设备并集；
+    - gap_ms_delta / covered_ms_delta 为"更正后 - 更正前"的总时长变化：
+      预演可能恶化（缺口变长）也可能改善（缺口变短），但 regressions 只列
+      "原先达标而预演后不达标"的区间。
+    """
+    points = {start_ms, end_ms}
+    for cov in (before, after):
+        for f in cov["fragments"]:
+            points.add(f["start_ms"])
+            points.add(f["end_ms"])
+    timeline = sorted(points)
+    before_starts = [f["start_ms"] for f in before["fragments"]]
+    after_starts = [f["start_ms"] for f in after["fragments"]]
+
+    regressions: list[dict] = []
+    for i in range(len(timeline) - 1):
+        t0, t1 = timeline[i], timeline[i + 1]
+        bf = _fragment_at(before["fragments"], before_starts, t0)
+        af = _fragment_at(after["fragments"], after_starts, t0)
+        worsened = bf["meets_threshold"] and not af["meets_threshold"]
+        if not worsened:
+            continue
+        if regressions and regressions[-1]["end_ms"] == t0:
+            g = regressions[-1]
+            g["end_ms"] = t1
+            g["duration_ms"] = t1 - g["start_ms"]
+            g["before_max_device_count"] = max(g["before_max_device_count"],
+                                               bf["device_count"])
+            g["after_max_device_count"] = max(g["after_max_device_count"],
+                                              af["device_count"])
+            g["before_device_ids"] = sorted(
+                set(g["before_device_ids"]) | set(bf["device_ids"]))
+            g["after_device_ids"] = sorted(
+                set(g["after_device_ids"]) | set(af["device_ids"]))
+        else:
+            regressions.append({
+                "start_ms": t0, "end_ms": t1, "duration_ms": t1 - t0,
+                "before_max_device_count": bf["device_count"],
+                "after_max_device_count": af["device_count"],
+                "before_device_ids": list(bf["device_ids"]),
+                "after_device_ids": list(af["device_ids"])})
+
+    regression_ms = sum(g["duration_ms"] for g in regressions)
+    return {
+        "worsened": bool(regressions),
+        "regression_count": len(regressions),
+        "regression_ms": regression_ms,
+        "regressions": regressions,
+        "gap_ms_before": before["gap_ms"],
+        "gap_ms_after": after["gap_ms"],
+        "gap_ms_delta": after["gap_ms"] - before["gap_ms"],
+        "covered_ms_before": before["covered_ms"],
+        "covered_ms_after": after["covered_ms"],
+        "covered_ms_delta": after["covered_ms"] - before["covered_ms"],
+    }
 
 
 # ---------------------------------------------------------------- 回放裁剪

@@ -143,6 +143,27 @@ class TimelineClient:
             "POST", f"/devices/{device_id}/cycles/{cycle_id}/drift-audit",
             payload)
 
+    # 锚点更正覆盖预演
+    def coverage_rehearse(self, device_id: str, anchors: list[dict],
+                          start_ms: int, end_ms: int, min_devices: int,
+                          fingerprint: str | None = None,
+                          cycle_id: str = "default"):
+        """锚点更正覆盖预演（只读）：实际更正前，在同一当前快照内分别按
+        现有锚点（before）与拟整体替换锚点（after）计算 [start_ms, end_ms)
+        的覆盖，返回两侧结论与"原先达标而预演后不达标"的连续区间。
+        fingerprint 省略时自动取周期详情中的当前指纹；指纹过期 -> 409
+        rehearsal_fingerprint_stale，周期已封存 -> 409 cycle_sealed，
+        锚点非严格递增 -> 400 anchors_not_increasing。"""
+        fp = fingerprint or self.cycle_detail(device_id, cycle_id)[1][
+            "cycle"]["fingerprint"]
+        payload = {"fingerprint": fp, "anchors": anchors,
+                   "start_ms": start_ms, "end_ms": end_ms,
+                   "min_devices": min_devices}
+        return self._call(
+            "POST",
+            f"/devices/{device_id}/cycles/{cycle_id}/coverage/rehearse",
+            payload)
+
 
 def show(title: str, status: int, body: dict) -> None:
     print(f"\n=== {title} (HTTP {status}) ===")
@@ -316,6 +337,39 @@ def main() -> None:
          *cli.drift_audit("D1", 100, version_no=999))
     show("周期不存在（404 cycle_not_found）",
          *cli.drift_audit("D1", 100, cycle_id="boot-x"))
+
+    # 15. 锚点更正覆盖预演（只读）：用独立设备 RD1/RD2 演示，避免与上文
+    #     已封存的 D1/default 冲突
+    cli.register_device("RD1", "预演-甲")
+    cli.register_device("RD2", "预演-乙")
+    for d in ("RD1", "RD2"):
+        cli.add_anchor(d, 0, 0)
+        cli.add_anchor(d, 100000, 100000)
+    cli.submit_segment("R-CAP-1", "RD1", 0, 10000)
+    cli.submit_segment("R-CAP-2", "RD2", 0, 10000)
+    #     before 整段两台达标；拟把 RD1 锚点 +4000ms 后，[0,4000) 只剩 RD2
+    #     -> comparison.regressions 列出该连续恶化区间；预演不写入
+    show("覆盖预演：RD1 锚点 +4000ms（worsened=true，[0,4000) 退化）",
+         *cli.coverage_rehearse(
+             "RD1", [{"local_ms": 0, "utc_ms": 4000},
+                     {"local_ms": 100000, "utc_ms": 104000}], 0, 10000, 2))
+    #     拟替换锚点与当前一致 -> 两侧相同，无恶化区间
+    show("覆盖预演：锚点不变（worsened=false）",
+         *cli.coverage_rehearse(
+             "RD1", [{"local_ms": 0, "utc_ms": 0},
+                     {"local_ms": 100000, "utc_ms": 100000}], 0, 10000, 2))
+    #     无效输入：锚点非严格递增 / 区间非法 / 设备不存在 -> 拒绝且不改数据
+    show("预演锚点非严格递增（400 anchors_not_increasing）",
+         *cli.coverage_rehearse(
+             "RD1", [{"local_ms": 0, "utc_ms": 100},
+                     {"local_ms": 5000, "utc_ms": 100}], 0, 10000, 2))
+    show("预演起点不小于终点（400 invalid_range）",
+         *cli.coverage_rehearse(
+             "RD1", [{"local_ms": 0, "utc_ms": 0}], 2000, 1000, 1))
+    show("预演设备不存在（404 device_not_found）",
+         *cli.coverage_rehearse(
+             "NOPE", [{"local_ms": 0, "utc_ms": 0}], 0, 1000, 1,
+             fingerprint="0" * 64))
 
 
 if __name__ == "__main__":

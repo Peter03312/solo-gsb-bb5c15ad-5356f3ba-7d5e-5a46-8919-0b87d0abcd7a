@@ -288,3 +288,86 @@ curl -s -X POST "$BASE/devices/D1/cycles/boot-x/drift-audit" \
 curl -s -X POST "$BASE/devices/D1/cycles/default/drift-audit" \
   -H 'Content-Type: application/json' \
   -d '{"max_drift_ppm":100,"version_no":999}' | pp
+
+# ----------------------------------------------------------------------
+# 锚点更正覆盖预演（coverage rehearsal，v1.7）：
+# 实际更正前，在同一当前快照对比"更正前/假设更正后"覆盖与恶化区间（只读）
+# ----------------------------------------------------------------------
+
+echo; echo "== 预演：建设备 RD1/RD2（恒等映射），各录一段 [0,10000) =="
+curl -s -X POST "$BASE/devices" -H 'Content-Type: application/json' \
+  -d '{"device_id":"RD1","name":"预演-甲"}' >/dev/null
+curl -s -X POST "$BASE/devices" -H 'Content-Type: application/json' \
+  -d '{"device_id":"RD2","name":"预演-乙"}' >/dev/null
+for D in RD1 RD2; do
+  curl -s -X POST "$BASE/devices/$D/anchors" -H 'Content-Type: application/json' \
+    -d '{"local_ms":0,"utc_ms":0}' >/dev/null
+  curl -s -X POST "$BASE/devices/$D/anchors" -H 'Content-Type: application/json' \
+    -d '{"local_ms":100000,"utc_ms":100000}' >/dev/null
+done
+curl -s -X POST "$BASE/segments" -H 'Content-Type: application/json' \
+  -d '{"capture_id":"R-CAP-1","device_id":"RD1","local_start_ms":0,"local_end_ms":10000}' >/dev/null
+curl -s -X POST "$BASE/segments" -H 'Content-Type: application/json' \
+  -d '{"capture_id":"R-CAP-2","device_id":"RD2","local_start_ms":0,"local_end_ms":10000}' >/dev/null
+
+RFP=$(curl -s "$BASE/devices/RD1/cycles/default" \
+  | python3 -c "import sys,json;print(json.load(sys.stdin)['cycle']['fingerprint'])")
+
+echo; echo "== 预演：拟把 RD1 锚点整体 +4000ms，[0,10000) 门槛 2 =="
+echo "-- before 整段达标；after 开头 4000ms 只剩 RD2；"
+echo "-- comparison.regressions 列出原先达标而预演后不达标的连续区间 --"
+curl -s -X POST "$BASE/devices/RD1/cycles/default/coverage/rehearse" \
+  -H 'Content-Type: application/json' \
+  -d "{\"fingerprint\":\"$RFP\",
+       \"anchors\":[{\"local_ms\":0,\"utc_ms\":4000},
+                    {\"local_ms\":100000,\"utc_ms\":104000}],
+       \"start_ms\":0,\"end_ms\":10000,\"min_devices\":2}" | pp
+
+echo; echo "== 预演只读：当前时间轴仍是更正前投影（RD1 声段起点仍为 0）=="
+curl -s "$BASE/segments/R-CAP-1" | pp
+
+echo; echo "== 预演拒绝场景（只读，均不改数据）=="
+echo "-- 指纹过期 -> 409 rehearsal_fingerprint_stale（details 附当前指纹）--"
+curl -s -X POST "$BASE/devices/RD1/anchors" -H 'Content-Type: application/json' \
+  -d '{"local_ms":50000,"utc_ms":50000}' >/dev/null
+curl -s -X POST "$BASE/devices/RD1/cycles/default/coverage/rehearse" \
+  -H 'Content-Type: application/json' \
+  -d "{\"fingerprint\":\"$RFP\",\"anchors\":[{\"local_ms\":0,\"utc_ms\":0}],
+       \"start_ms\":0,\"end_ms\":1000,\"min_devices\":1}" | pp
+echo "-- 锚点不严格递增 -> 400 anchors_not_increasing；空列表 -> 400 validation_error --"
+RFP2=$(curl -s "$BASE/devices/RD1/cycles/default" \
+  | python3 -c "import sys,json;print(json.load(sys.stdin)['cycle']['fingerprint'])")
+curl -s -X POST "$BASE/devices/RD1/cycles/default/coverage/rehearse" \
+  -H 'Content-Type: application/json' \
+  -d "{\"fingerprint\":\"$RFP2\",
+       \"anchors\":[{\"local_ms\":0,\"utc_ms\":100},{\"local_ms\":5000,\"utc_ms\":100}],
+       \"start_ms\":0,\"end_ms\":1000,\"min_devices\":1}" | pp
+curl -s -X POST "$BASE/devices/RD1/cycles/default/coverage/rehearse" \
+  -H 'Content-Type: application/json' \
+  -d "{\"fingerprint\":\"$RFP2\",\"anchors\":[],
+       \"start_ms\":0,\"end_ms\":1000,\"min_devices\":1}" | pp
+echo "-- 区间/门槛/时间非法 -> 400 invalid_range / invalid_threshold / invalid_time --"
+curl -s -X POST "$BASE/devices/RD1/cycles/default/coverage/rehearse" \
+  -H 'Content-Type: application/json' \
+  -d "{\"fingerprint\":\"$RFP2\",\"anchors\":[{\"local_ms\":0,\"utc_ms\":0}],
+       \"start_ms\":2000,\"end_ms\":1000,\"min_devices\":1}" | pp
+curl -s -X POST "$BASE/devices/RD1/cycles/default/coverage/rehearse" \
+  -H 'Content-Type: application/json' \
+  -d "{\"fingerprint\":\"$RFP2\",\"anchors\":[{\"local_ms\":0,\"utc_ms\":0}],
+       \"start_ms\":0,\"end_ms\":1000,\"min_devices\":0}" | pp
+echo "-- 设备/周期不存在 -> 404 device_not_found / cycle_not_found --"
+curl -s -X POST "$BASE/devices/NOPE/cycles/default/coverage/rehearse" \
+  -H 'Content-Type: application/json' \
+  -d '{"fingerprint":"0000000000000000000000000000000000000000000000000000000000000000",
+       "anchors":[{"local_ms":0,"utc_ms":0}],"start_ms":0,"end_ms":1000,"min_devices":1}' | pp
+curl -s -X POST "$BASE/devices/RD1/cycles/boot-x/coverage/rehearse" \
+  -H 'Content-Type: application/json' \
+  -d "{\"fingerprint\":\"$RFP2\",\"anchors\":[{\"local_ms\":0,\"utc_ms\":0}],
+       \"start_ms\":0,\"end_ms\":1000,\"min_devices\":1}" | pp
+echo "-- 封存后预演 -> 409 cycle_sealed --"
+curl -s -X POST "$BASE/devices/RD1/cycles/default/seal" \
+  -H 'Content-Type: application/json' -d "{\"fingerprint\":\"$RFP2\"}" >/dev/null
+curl -s -X POST "$BASE/devices/RD1/cycles/default/coverage/rehearse" \
+  -H 'Content-Type: application/json' \
+  -d "{\"fingerprint\":\"$RFP2\",\"anchors\":[{\"local_ms\":0,\"utc_ms\":0}],
+       \"start_ms\":0,\"end_ms\":1000,\"min_devices\":1}" | pp

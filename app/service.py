@@ -26,11 +26,13 @@ from datetime import datetime, timezone
 from . import db
 from .logic import (ApiError, DEFAULT_CYCLE_ID, STATUS_LOCATED,
                     STATUS_UNLOCATABLE, compute_changes, compute_clips,
-                    compute_coverage, compute_drift_report, cycle_fingerprint,
+                    compute_coverage, compute_drift_report,
+                    compute_rehearsal_regressions, cycle_fingerprint,
                     project_segment, require_fields, require_payload,
-                    segment_content_hash, sort_projections, validate_cycle_id,
-                    validate_fingerprint, validate_id, validate_max_drift_ppm,
-                    validate_min_devices, validate_ms, validate_note)
+                    segment_content_hash, sort_projections, validate_anchor_chain,
+                    validate_cycle_id, validate_fingerprint, validate_id,
+                    validate_max_drift_ppm, validate_min_devices, validate_ms,
+                    validate_note)
 from .db import SCHEMA_VERSION
 
 
@@ -884,6 +886,118 @@ def coverage_audit(db_path: str, body):
     return 200, {"source": source, "version_no": version_no,
                  "start_ms": start_ms, "end_ms": end_ms,
                  "min_devices": min_devices, **result}
+
+
+# ------------------------------------------------------------ 锚点更正覆盖预演
+
+def coverage_rehearse(db_path: str, device_id: str, cycle_id: str, body):
+    """锚点更正覆盖预演（what-if，只读）：现场人员实际更正某设备某周期锚点
+    前，在同一当前快照内分别计算"更正前"与"假设整体替换锚点后"的覆盖，
+    判断指定 UTC 半开时段的录音覆盖会否恶化。
+
+    - 路径参数 device_id / cycle_id 指定拟更正的设备周期；
+    - 请求体 {fingerprint, anchors, start_ms, end_ms, min_devices}：
+      * fingerprint：GET 周期详情中的内容指纹，与当前内容不一致（指纹过期）
+        -> 409 rehearsal_fingerprint_stale；
+      * anchors：拟整体替换该周期的非空锚点列表（仅 local_ms/utc_ms，
+        毫秒整数；local_ms 唯一且按之排序后 utc_ms 严格递增，
+        否则 400 anchors_not_increasing）；
+      * start_ms/end_ms：审计半开区间 [start_ms, end_ms)；
+      * min_devices：最少设备数（正整数）；
+    - 周期已封存 -> 409 cycle_sealed；时间/门槛非法 -> 400；
+      设备/周期不存在 -> 404；
+    - 预演只在内存中替换 (device_id, cycle_id) 的锚点对，其他周期与设备
+      全部保持当前值；声段按所属周期锚点以现有线性漂移与毫秒取整规则
+      重新投影，不可定位声段不计、同设备重叠声段只算一台；
+    - 整个计算在单个读事务的一致快照上完成，不写入、不影响当前时间轴
+      或任何已发布版本。
+    """
+    payload = require_payload(body)
+    require_fields(payload, ["fingerprint", "anchors",
+                             "start_ms", "end_ms", "min_devices"])
+    fingerprint = validate_fingerprint(payload["fingerprint"])
+    items = payload["anchors"]
+    if not isinstance(items, list):
+        raise ApiError(400, "validation_error", "anchors 必须是数组",
+                       {"received_type": type(items).__name__})
+    if not items:
+        raise ApiError(400, "validation_error",
+                       "anchors 不能为空：预演的拟替换锚点列表必须非空",
+                       {"anchors": items})
+    proposed: list[tuple[int, int]] = []
+    for i, item in enumerate(items):
+        if not isinstance(item, dict):
+            raise ApiError(400, "validation_error", f"anchors[{i}] 必须是对象")
+        require_fields(item, ["local_ms", "utc_ms"])
+        proposed.append((
+            validate_ms(item["local_ms"], f"anchors[{i}].local_ms"),
+            validate_ms(item["utc_ms"], f"anchors[{i}].utc_ms")))
+    # 严格递增预校验（与 PUT 锚点更正同一错误契约），不通过即拒绝、不读库
+    validate_anchor_chain(proposed)
+    start_ms = validate_ms(payload["start_ms"], "start_ms")
+    end_ms = validate_ms(payload["end_ms"], "end_ms")
+    if start_ms >= end_ms:
+        raise ApiError(400, "invalid_range",
+                       f"查询区间起点 start_ms={start_ms} 必须小于终点 "
+                       f"end_ms={end_ms}（半开区间 [start_ms, end_ms)）",
+                       {"start_ms": start_ms, "end_ms": end_ms})
+    min_devices = validate_min_devices(payload["min_devices"])
+
+    with db.session(db_path) as conn, db.read_txn(conn):
+        _get_device(conn, device_id)
+        cycle = _get_cycle(conn, device_id, cycle_id)
+        # 已封存周期的锚点不允许更正，预演同样明确拒绝（实际更正会被拒绝）
+        _raise_if_sealed(cycle)
+        anchors, segs = _cycle_contents(conn, device_id, cycle_id)
+        current_fp = cycle_fingerprint(device_id, cycle_id, anchors, segs)
+        if fingerprint != current_fp:
+            raise ApiError(
+                409, "rehearsal_fingerprint_stale",
+                f"请求指纹与设备 {device_id} 周期 {cycle_id} 的当前内容不一致"
+                f"（内容已变化，指纹过期），请重新获取周期详情后再预演；"
+                f"预演只读，未改动任何数据",
+                {"device_id": device_id, "cycle_id": cycle_id,
+                 "current_fingerprint": current_fp})
+
+        # 同一当前快照：读全部锚点与全部声段
+        anchors_map = _anchors_map(conn)
+        seg_rows = conn.execute("SELECT * FROM segments ORDER BY capture_id").fetchall()
+        segments = [_row_to_segment(r) for r in seg_rows]
+
+        def located_with(mapping):
+            located = []
+            for seg in segments:
+                proj = project_segment(
+                    seg, mapping.get((seg["device_id"], seg["cycle_id"]), ([], [])))
+                if proj["status"] == STATUS_LOCATED:
+                    located.append(proj)
+            return located
+
+        # 更正前：当前锚点表
+        before = compute_coverage(located_with(anchors_map),
+                                  start_ms, end_ms, min_devices)
+        # 假设更正后：仅替换目标周期锚点，其他周期/设备保持当前值
+        proposed_pairs = validate_anchor_chain(proposed)
+        rehearsal_map = dict(anchors_map)
+        rehearsal_map[(device_id, cycle_id)] = (
+            [l for l, _ in proposed_pairs],
+            [u for _, u in proposed_pairs])
+        after = compute_coverage(located_with(rehearsal_map),
+                                 start_ms, end_ms, min_devices)
+
+    comparison = compute_rehearsal_regressions(before, after, start_ms, end_ms)
+    return 200, {
+        "device_id": device_id, "cycle_id": cycle_id,
+        "fingerprint": fingerprint,
+        "start_ms": start_ms, "end_ms": end_ms,
+        "min_devices": min_devices,
+        "proposed_anchor_count": len(proposed_pairs),
+        "before": before,
+        "after": after,
+        "comparison": comparison,
+        "worsened": comparison["worsened"],
+        "message": "预演只读：未改动当前时间轴与已发布版本",
+    }
 
 
 # ---------------------------------------------------------------- 回放裁剪
